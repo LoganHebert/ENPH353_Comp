@@ -25,14 +25,7 @@ from sklearn.utils.class_weight import compute_class_weight
 IMAGE_DIR = "/content/drive/MyDrive/353_data/images/train"
 REAL_LINE_DIR = "/content/drive/MyDrive/353_photos"
 
-BASE_MODEL_KERAS_PATH = "/content/drive/MyDrive/sign_char_model.keras"
-BASE_MODEL_TFLITE_PATH = "/content/drive/MyDrive/sign_char_model.tflite"
-
-FINETUNED_MODEL_KERAS_PATH = "/content/drive/MyDrive/sign_char_model_finetuned.keras"
-FINETUNED_MODEL_TFLITE_PATH = "/content/drive/MyDrive/sign_char_model_finetuned.tflite"
-
-CLASSES_PATH = "/content/drive/MyDrive/sign_char_classes.json"
-
+# 37 classes now: 0-9, A-Z, and SPACE
 SPACE_TOKEN = " "
 CLASSES = list("0123456789") + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + [SPACE_TOKEN]
 DISPLAY_CLASSES = [c if c != " " else "␠" for c in CLASSES]
@@ -48,25 +41,24 @@ files = sorted([
     if f.lower().endswith((".png", ".jpg", ".jpeg"))
 ])
 
-real_files = sorted([
-    f for f in os.listdir(REAL_LINE_DIR)
-    if f.lower().endswith((".png", ".jpg", ".jpeg"))
-])
-
-print("num generated files:", len(files))
-print("num real line files:", len(real_files))
+print("num files:", len(files))
 print(files[:10])
-print(real_files[:10])
-
 
 def normalize_space_text(text: str) -> str:
+    """
+    Support both conventions:
+    - actual spaces
+    - ~ meaning space
+    """
     return text.replace("~", " ").upper()
 
 
 def parse_filename(fname):
     """
-    Expected generated filename style:
+    Expected training filename style:
     <index>_<clue_type>_<clue_value>_<variant>.png
+
+    clue_value may contain ~ to indicate spaces.
     """
     stem = os.path.splitext(fname)[0]
     parts = stem.split("_")
@@ -79,20 +71,25 @@ def parse_filename(fname):
     return index, clue_type, clue_value, variant
 
 
-def parse_line_filename(fname):
-    """
-    Real line filenames:
-    - ABC~12_001.png  -> "ABC 12"
-    - AB 12_001.png   -> "AB 12"
-    """
-    stem = os.path.splitext(fname)[0]
-    text = stem.split("_")[0]
-    return normalize_space_text(text)
-
-
 for f in files[:10]:
     print(f, "->", parse_filename(f))
 
+sample_file = random.choice(files)
+sample_path = os.path.join(IMAGE_DIR, sample_file)
+
+img = cv2.imread(sample_path)
+img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+print("sample file:", sample_file)
+print("parsed:", parse_filename(sample_file))
+
+plt.figure(figsize=(8, 8))
+plt.imshow(img_rgb)
+plt.axis("off")
+plt.title(sample_file)
+plt.show()
+
+# 6
 def order_points(pts):
     pts = np.array(pts, dtype=np.float32)
     s = pts.sum(axis=1)
@@ -106,7 +103,7 @@ def order_points(pts):
     return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
 
 
-def four_point_transform(image, pts, out_w=400, out_h=300):
+def four_point_transform(image, pts, out_w=400, out_h=600):
     rect = order_points(pts)
     dst = np.array([
         [0, 0],
@@ -121,122 +118,108 @@ def four_point_transform(image, pts, out_w=400, out_h=300):
 
 
 def detect_and_warp_sign(img_bgr, debug=False):
-    """
-    Match sign_detector logic more closely:
-    - darker blue mask to avoid sky
-    - candidate contour scoring
-    - 400x300 warp
-    """
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    lower_blue = np.array([100, 120, 25])
-    upper_blue = np.array([140, 255, 200])
+    lower_blue = np.array([100, 100, 50])
+    upper_blue = np.array([140, 255, 255])
     mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), iterations=1)
-
-    H, W = mask.shape[:2]
-    frame_area = float(H * W)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None, mask, None
 
-    candidates = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 0.004 * frame_area:
-            continue
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
 
-        x, y, w, h = cv2.boundingRect(c)
-        if x <= 6 or y <= 6 or (x + w) >= (W - 6) or (y + h) >= (H - 6):
-            continue
-
-        rect = cv2.minAreaRect(c)
-        rw, rh = rect[1]
-        rw = max(float(rw), 1e-6)
-        rh = max(float(rh), 1e-6)
-        aspect = max(rw, rh) / min(rw, rh)
-
-        if not (0.75 <= aspect <= 3.4):
-            continue
-
-        box_area = float(w * h) + 1e-6
-        extent = float(area) / box_area
-
-        hull = cv2.convexHull(c)
-        hull_area = float(cv2.contourArea(hull)) + 1e-6
-        solidity = float(area) / hull_area
-
-        roi = mask[y:y+h, x:x+w]
-        fill = float(np.count_nonzero(roi)) / float(roi.size + 1e-6)
-
-        expected_aspect = 1.6
-        aspect_score = 1.0 - min(1.0, abs(aspect - expected_aspect) / expected_aspect)
-
-        score = (
-            3.0 * (area / frame_area) +
-            0.8 * extent +
-            1.0 * aspect_score +
-            0.4 * solidity +
-            0.6 * fill
-        )
-
-        candidates.append((score, c))
-
-    if not candidates:
-        c = max(cnts, key=cv2.contourArea)
-        candidates = [(0.0, c)]
-
-    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:10]
-
-    best_warp = None
-    best_quad = None
-    best_score = -1e9
-
-    for score, c in candidates:
+    chosen_quad = None
+    for c in cnts[:10]:
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.03 * peri, True)
 
         if len(approx) == 4:
-            quad = approx.reshape(4, 2)
-        else:
-            rect = cv2.minAreaRect(c)
-            quad = cv2.boxPoints(rect).astype(int)
+            chosen_quad = approx.reshape(4, 2)
+            break
 
-        warped = four_point_transform(img_bgr, quad, out_w=400, out_h=300)
+    if chosen_quad is None:
+        c = cnts[0]
+        rect = cv2.minAreaRect(c)
+        box = cv2.boxPoints(rect)
+        chosen_quad = box.astype(int)
 
-        if score > best_score:
-            best_score = score
-            best_warp = warped
-            best_quad = quad
+    warped = four_point_transform(img_bgr, chosen_quad, out_w=400, out_h=300)
 
     if debug:
         dbg = img_bgr.copy()
-        cv2.drawContours(dbg, [best_quad.astype(int)], -1, (0, 255, 0), 3)
-        return best_warp, mask, dbg
+        cv2.drawContours(dbg, [chosen_quad.astype(int)], -1, (0, 255, 0), 3)
+        return warped, mask, dbg
 
-    return best_warp, mask, None
+    return warped, mask, None
 
+sample_file = random.choice(files)
+sample_path = os.path.join(IMAGE_DIR, sample_file)
+img = cv2.imread(sample_path)
+
+warped, mask, dbg = detect_and_warp_sign(img, debug=True)
+
+print(sample_file)
+print(parse_filename(sample_file))
+
+plt.figure(figsize=(15, 5))
+plt.subplot(1, 3, 1)
+plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+plt.title("Original")
+plt.axis("off")
+
+plt.subplot(1, 3, 2)
+plt.imshow(mask, cmap="gray")
+plt.title("Blue mask")
+plt.axis("off")
+
+plt.subplot(1, 3, 3)
+plt.imshow(cv2.cvtColor(dbg, cv2.COLOR_BGR2RGB))
+plt.title("Detected sign")
+plt.axis("off")
+plt.show()
+
+if warped is not None:
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+    plt.title("Warped sign")
+    plt.axis("off")
+    plt.show()
+else:
+    print("Failed to warp sign")
+
+# 8
 def split_sign_lines(warped_bgr):
-    """
-    Match the sign_detector proportions.
-    """
     h, w = warped_bgr.shape[:2]
 
-    top_line = warped_bgr[int(0.05 * h):int(0.40 * h), int(0.30 * w):int(0.92 * w)]
-    bottom_line = warped_bgr[int(0.55 * h):int(0.90 * h), int(0.05 * w):int(0.92 * w)]
+    top_line = warped_bgr[int(0.10 * h):int(0.38 * h), int(0.42 * w):int(0.92 * w)]
+    bottom_line = warped_bgr[int(0.58 * h):int(0.88 * h), int(0.08 * w):int(0.92 * w)]
 
     return top_line, bottom_line
 
 
+top_line, bottom_line = split_sign_lines(warped)
+
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.imshow(cv2.cvtColor(top_line, cv2.COLOR_BGR2RGB))
+plt.title("Top line")
+plt.axis("off")
+
+plt.subplot(1, 2, 2)
+plt.imshow(cv2.cvtColor(bottom_line, cv2.COLOR_BGR2RGB))
+plt.title("Bottom line")
+plt.axis("off")
+plt.show()
+
 def preprocess_training_crop(crop_bgr):
-    """
-    Must match runtime preprocessing exactly.
-    """
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+
     gray = cv2.equalizeHist(gray)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
@@ -260,86 +243,46 @@ def preprocess_training_crop(crop_bgr):
 
 def make_space_crop():
     """
-    Explicit SPACE sample.
+    Explicit synthetic crop for the SPACE class.
+    Keep it blank because a space should correspond to no visible character.
     """
     return np.zeros((32, 32), dtype=np.uint8)
 
-def clean_blue_mask(mask):
+# 10
+def segment_visible_chars_from_line(line_bgr, debug=False):
     """
-    Gentler than old notebook code.
-    Preserves letters like P, R, B, 0.
+    Segment only visible characters.
+    Spaces are NOT segmented here.
+    Spaces will be added as synthetic blank samples during dataset assembly.
     """
-    m = mask.copy()
-    m = cv2.medianBlur(m, 3)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
-    return m
+    hsv = cv2.cvtColor(line_bgr, cv2.COLOR_BGR2HSV)
 
+    lower_blue = np.array([90, 40, 40])
+    upper_blue = np.array([150, 255, 255])
+    mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
-def strip_edges_if_needed(mask):
-    """
-    Remove border strips only if they look like vertical frame bars.
-    """
+    mask = cv2.medianBlur(mask, 3)
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
     H, W = mask.shape[:2]
-    col_ratio = np.sum(mask > 0, axis=0).astype(np.float32) / float(H + 1e-6)
 
-    max_strip = int(0.12 * W)
+    # Projection-based splitting works better for these line images
+    col_sum = np.sum(mask > 0, axis=0).astype(float)
+    col_sum = col_sum / (np.max(col_sum) + 1e-6)
 
-    left_w = 0
-    streak = 0
-    for i in range(W):
-        if col_ratio[i] >= 0.65:
-            streak += 1
-            left_w = i + 1
-        else:
-            if streak >= 3:
-                break
-            streak = 0
-            left_w = 0
-
-    right_w = 0
-    streak = 0
-    for k, i in enumerate(range(W - 1, -1, -1)):
-        if col_ratio[i] >= 0.65:
-            streak += 1
-            right_w = k + 1
-        else:
-            if streak >= 3:
-                break
-            streak = 0
-            right_w = 0
-
-    left_w = min(left_w, max_strip)
-    right_w = min(right_w, max_strip)
-
-    out = mask.copy()
-    if left_w > 0:
-        out[:, :left_w] = 0
-    if right_w > 0:
-        out[:, W - right_w:] = 0
-    return out
-
-
-def projection_boxes(mask):
-    H, W = mask.shape[:2]
-    col_sum = np.sum(mask > 0, axis=0).astype(np.float32)
-    peak = float(np.max(col_sum)) if col_sum.size else 0.0
-    if peak <= 0:
-        return []
-
-    col_norm = col_sum / (peak + 1e-6)
     threshold = 0.05
-
     splits = []
     in_char = False
     start = 0
 
-    for i, val in enumerate(col_norm):
+    for i, val in enumerate(col_sum):
         if val > threshold and not in_char:
             start = i
             in_char = True
         elif val <= threshold and in_char:
-            splits.append((start, i))
+            end = i
+            splits.append((start, end))
             in_char = False
 
     if in_char:
@@ -351,7 +294,7 @@ def projection_boxes(mask):
 
         if width < 3:
             continue
-        if width > 0.85 * W:
+        if width > 0.35 * W:
             continue
 
         col_region = mask[:, x0:x1]
@@ -360,197 +303,37 @@ def projection_boxes(mask):
         if len(rows) == 0:
             continue
 
-        y0 = int(rows[0])
-        y1 = int(rows[-1] + 1)
-        h = y1 - y0
+        y0 = rows[0]
+        y1 = rows[-1]
 
-        if h < 0.28 * H:
+        w = width
+        h = y1 - y0 + 1
+
+        if h < 0.30 * H:
             continue
 
-        boxes.append((x0, y0, width, h))
+        boxes.append((x0, y0, w, h))
 
-    return sorted(boxes, key=lambda b: b[0])
-
-
-def contour_boxes(mask):
-    H, W = mask.shape[:2]
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-
-        if w * h < 20:
-            continue
-        if h < 0.28 * H:
-            continue
-        if w > 0.85 * W:
-            continue
-
-        fill = float(cv2.contourArea(c)) / float((w * h) + 1e-6)
-        if fill < 0.08:
-            continue
-
-        boxes.append((x, y, w, h))
-
-    return sorted(boxes, key=lambda b: b[0])
-
-
-def _tight_box_from_roi(roi, x_off, y_off):
-    ys, xs = np.where(roi > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return None
-    x0 = int(xs.min())
-    x1 = int(xs.max() + 1)
-    y0 = int(ys.min())
-    y1 = int(ys.max() + 1)
-    return (x_off + x0, y_off + y0, x1 - x0, y1 - y0)
-
-
-def split_wide_box_once(mask, box, valley_rel=0.65):
-    """
-    One split attempt inside a wide merged blob.
-    """
-    x, y, w, h = box
-    roi = mask[y:y+h, x:x+w]
-    if roi.size == 0 or w < 10:
-        return [box]
-
-    col = np.sum(roi > 0, axis=0).astype(np.float32)
-    peak = float(np.max(col)) if col.size else 0.0
-    if peak <= 0:
-        return [box]
-
-    col = np.convolve(col, np.ones(5) / 5.0, mode="same")
-
-    l = max(2, int(0.18 * w))
-    r = min(w - 2, int(0.82 * w))
-    if r <= l:
-        return [box]
-
-    best_s = None
-    best_val = None
-
-    for s in range(l, r):
-        valley = float(col[s])
-        left_peak = float(np.max(col[:s])) if s > 0 else 0.0
-        right_peak = float(np.max(col[s:])) if s < w else 0.0
-
-        if left_peak < 1e-6 or right_peak < 1e-6:
-            continue
-
-        if valley <= valley_rel * min(left_peak, right_peak):
-            if best_val is None or valley < best_val:
-                best_val = valley
-                best_s = s
-
-    if best_s is None:
-        return [box]
-
-    s = int(best_s)
-    left_roi = roi[:, :s]
-    right_roi = roi[:, s:]
-
-    b1 = _tight_box_from_roi(left_roi, x, y)
-    b2 = _tight_box_from_roi(right_roi, x + s, y)
-
-    out = []
-    for b in (b1, b2):
-        if b is None:
-            continue
-        bx, by, bw, bh = b
-        if bw >= 3 and bh >= int(0.28 * mask.shape[0]):
-            out.append((bx, by, bw, bh))
-
-    return out if len(out) == 2 else [box]
-
-
-def recursive_split_boxes(mask, boxes, merge_w_factor=1.20, max_depth=6):
-    """
-    Recursively split merged letters like PLACE / LAB.
-    """
-    if not boxes:
-        return []
-
-    out = sorted(boxes, key=lambda b: b[0])
-
-    for _ in range(max_depth):
-        widths = np.array([b[2] for b in out], dtype=np.float32)
-        median_w = float(np.median(widths)) if len(widths) else 0.0
-        if median_w <= 0:
-            break
-
-        changed = False
-        new_out = []
-
-        for b in out:
-            if b[2] > merge_w_factor * median_w:
-                split = split_wide_box_once(mask, b, valley_rel=0.65)
-                if len(split) == 2:
-                    new_out.extend(split)
-                    changed = True
-                else:
-                    new_out.append(b)
-            else:
-                new_out.append(b)
-
-        out = sorted(new_out, key=lambda b: b[0])
-
-        if not changed:
-            break
-
-    return out
-
-
-def infer_spaces_from_boxes(boxes):
-    """
-    Runtime-style space inference from large gaps.
-    Returns a list of booleans of length len(boxes)-1 telling whether a space
-    should be inserted after each character.
-    """
-    if len(boxes) < 2:
-        return []
-
-    widths = np.array([b[2] for b in boxes], dtype=np.float32)
-    median_w = float(np.median(widths)) if len(widths) else 0.0
-
-    gaps = []
-    for i in range(len(boxes) - 1):
-        x, y, w, h = boxes[i]
-        x2, y2, w2, h2 = boxes[i + 1]
-        gaps.append(max(0, x2 - (x + w)))
-
-    median_gap = float(np.median(gaps)) if gaps else 0.0
-    gap_thr = max(8.0, 1.35 * max(median_gap, 0.25 * median_w))
-
-    return [g > gap_thr for g in gaps]
-
-# 6
-def segment_visible_chars_from_line(line_bgr, debug=False):
-    """
-    Segment only VISIBLE characters.
-    Spaces are not segmented here.
-    """
-    hsv = cv2.cvtColor(line_bgr, cv2.COLOR_BGR2HSV)
-
-    lower_blue = np.array([90, 40, 35])
-    upper_blue = np.array([150, 255, 255])
-    mask = cv2.inRange(hsv, lower_blue, upper_blue)
-
-    mask = clean_blue_mask(mask)
-    mask = strip_edges_if_needed(mask)
-
-    boxes = projection_boxes(mask)
+    # Fallback to contours if projection fails
     if len(boxes) == 0:
-        boxes = contour_boxes(mask)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
 
-    boxes = recursive_split_boxes(mask, boxes, merge_w_factor=1.20, max_depth=6)
+            if w * h < 20:
+                continue
+            if h < 0.30 * H:
+                continue
+            if w > 0.35 * W:
+                continue
 
-    H, W = mask.shape[:2]
+            boxes.append((x, y, w, h))
+
+    boxes = sorted(boxes, key=lambda b: b[0])
+
     crops = []
-
     for x, y, w, h in boxes:
-        pad = max(2, int(0.18 * max(w, h)))
+        pad = max(2, int(0.12 * max(w, h)))
         x0 = max(0, x - pad)
         y0 = max(0, y - pad)
         x1 = min(W, x + w + pad)
@@ -568,111 +351,42 @@ def segment_visible_chars_from_line(line_bgr, debug=False):
 
     return crops, mask, None, boxes
 
+idx, clue_type, clue_value, variant = parse_filename(sample_file)
 
-def segment_real_line_image(line_bgr, debug=False):
-    """
-    Same logic as generated line segmentation.
-    """
-    hsv = cv2.cvtColor(line_bgr, cv2.COLOR_BGR2HSV)
+top_crops, top_mask, top_dbg, top_boxes = segment_visible_chars_from_line(top_line, debug=True)
+bot_crops, bot_mask, bot_dbg, bot_boxes = segment_visible_chars_from_line(bottom_line, debug=True)
 
-    lower_blue = np.array([90, 40, 35])
-    upper_blue = np.array([150, 255, 255])
-    mask = cv2.inRange(hsv, lower_blue, upper_blue)
+print("Top expected:", clue_type, "detected boxes:", len(top_boxes))
+print("Bottom expected:", clue_value, "detected visible boxes:", len(bot_boxes))
+print("Bottom expected visible count:", len(clue_value.replace(" ", "")))
 
-    mask = clean_blue_mask(mask)
-    mask = strip_edges_if_needed(mask)
-
-    boxes = projection_boxes(mask)
-    if len(boxes) == 0:
-        boxes = contour_boxes(mask)
-
-    boxes = recursive_split_boxes(mask, boxes, merge_w_factor=1.20, max_depth=6)
-
-    H, W = mask.shape[:2]
-    crops = []
-
-    for x, y, w, h in boxes:
-        pad = max(2, int(0.18 * max(w, h)))
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(W, x + w + pad)
-        y1 = min(H, y + h + pad)
-
-        crop = line_bgr[y0:y1, x0:x1]
-        processed = preprocess_training_crop(crop)
-        crops.append(processed)
-
-    if debug:
-        dbg = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        for x, y, w, h in boxes:
-            cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        return crops, mask, dbg, boxes
-
-    return crops, mask, None, boxes
-
-sample_file = random.choice(files)
-sample_path = os.path.join(IMAGE_DIR, sample_file)
-
-img = cv2.imread(sample_path)
-warped, mask, dbg = detect_and_warp_sign(img, debug=True)
-
-print("sample file:", sample_file)
-print("parsed:", parse_filename(sample_file))
-
-plt.figure(figsize=(15, 5))
-plt.subplot(1, 3, 1)
-plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-plt.title("Original")
+plt.figure(figsize=(12, 4))
+plt.subplot(2, 2, 1)
+plt.imshow(cv2.cvtColor(top_dbg, cv2.COLOR_BGR2RGB))
+plt.title("Top debug")
 plt.axis("off")
 
-plt.subplot(1, 3, 2)
-plt.imshow(mask, cmap="gray")
-plt.title("Blue mask")
+plt.subplot(2, 2, 2)
+plt.imshow(top_mask, cmap="gray")
+plt.title("Top mask")
 plt.axis("off")
 
-plt.subplot(1, 3, 3)
-plt.imshow(cv2.cvtColor(dbg, cv2.COLOR_BGR2RGB))
-plt.title("Detected sign")
+plt.subplot(2, 2, 3)
+plt.imshow(cv2.cvtColor(bot_dbg, cv2.COLOR_BGR2RGB))
+plt.title("Bottom debug")
+plt.axis("off")
+
+plt.subplot(2, 2, 4)
+plt.imshow(bot_mask, cmap="gray")
+plt.title("Bottom mask")
 plt.axis("off")
 plt.show()
 
-if warped is not None:
-    top_line, bottom_line = split_sign_lines(warped)
+print("Top target len:", len(clue_type))
+print("Bottom target len (with spaces):", len(clue_value))
+print("Bottom target len (visible only):", len(clue_value.replace(" ", "")))
 
-    idx, clue_type, clue_value, variant = parse_filename(sample_file)
-
-    top_crops, top_mask, top_dbg, top_boxes = segment_visible_chars_from_line(top_line, debug=True)
-    bot_crops, bot_mask, bot_dbg, bot_boxes = segment_visible_chars_from_line(bottom_line, debug=True)
-
-    print("Top expected:", clue_type, "detected boxes:", len(top_boxes))
-    print("Bottom expected:", repr(clue_value), "detected visible boxes:", len(bot_boxes))
-    print("Bottom expected visible count:", len(clue_value.replace(" ", "")))
-    print("Space pattern inferred from boxes:", infer_spaces_from_boxes(bot_boxes))
-
-    plt.figure(figsize=(12, 5))
-    plt.subplot(2, 2, 1)
-    plt.imshow(cv2.cvtColor(top_dbg, cv2.COLOR_BGR2RGB))
-    plt.title("Top debug")
-    plt.axis("off")
-
-    plt.subplot(2, 2, 2)
-    plt.imshow(top_mask, cmap="gray")
-    plt.title("Top mask")
-    plt.axis("off")
-
-    plt.subplot(2, 2, 3)
-    plt.imshow(cv2.cvtColor(bot_dbg, cv2.COLOR_BGR2RGB))
-    plt.title("Bottom debug")
-    plt.axis("off")
-
-    plt.subplot(2, 2, 4)
-    plt.imshow(bot_mask, cmap="gray")
-    plt.title("Bottom mask")
-    plt.axis("off")
-    plt.show()
-else:
-    print("Failed to warp sign")
-
+# Segmegnt blue chars from one line, 12
 X = []
 y = []
 
@@ -683,7 +397,6 @@ bad_examples = []
 for fname in files:
     path = os.path.join(IMAGE_DIR, fname)
     img = cv2.imread(path)
-
     if img is None:
         bad += 1
         bad_examples.append((fname, "imread failed"))
@@ -691,7 +404,7 @@ for fname in files:
 
     _, clue_type, clue_value, _ = parse_filename(fname)
 
-    warped, _, _ = detect_and_warp_sign(img, debug=False)
+    warped, mask, dbg = detect_and_warp_sign(img, debug=False)
     if warped is None:
         bad += 1
         bad_examples.append((fname, "warp failed"))
@@ -716,16 +429,21 @@ for fname in files:
         bad_examples.append((fname, f"bottom visible count mismatch: got {len(bot_crops)} expected {len(bottom_target_visible)}"))
         continue
 
+    # Top line: always visible chars
     for crop, ch in zip(top_crops, top_target):
-        if ch in CLASS_TO_IDX:
-            X.append(crop)
-            y.append(CLASS_TO_IDX[ch])
+        if ch not in CLASS_TO_IDX:
+            continue
+        X.append(crop)
+        y.append(CLASS_TO_IDX[ch])
 
+    # Bottom line: visible chars only
     for crop, ch in zip(bot_crops, bottom_target_visible):
-        if ch in CLASS_TO_IDX:
-            X.append(crop)
-            y.append(CLASS_TO_IDX[ch])
+        if ch not in CLASS_TO_IDX:
+            continue
+        X.append(crop)
+        y.append(CLASS_TO_IDX[ch])
 
+    # Add explicit SPACE samples for spaces in the label
     for ch in bottom_target_full:
         if ch == " ":
             X.append(make_space_crop())
@@ -737,12 +455,12 @@ X = np.array(X, dtype=np.float32) / 255.0
 X = X[..., None]
 y = np.array(y, dtype=np.int64)
 
-print("good generated images:", good)
-print("bad generated images:", bad)
+print("good images:", good)
+print("bad images:", bad)
 print("X shape:", X.shape)
 print("y shape:", y.shape)
 print("unique classes:", len(set(y.tolist())))
-print("some bad examples:", bad_examples[:15])
+print("some bad examples:", bad_examples[:10])
 
 counts = np.bincount(y, minlength=len(CLASSES))
 
@@ -752,7 +470,7 @@ print("missing classes:", [DISPLAY_CLASSES[i] for i in range(len(CLASSES)) if co
 
 plt.figure(figsize=(14, 4))
 plt.bar(DISPLAY_CLASSES, counts)
-plt.title("Generated training character distribution (including space)")
+plt.title("Character distribution (including space)")
 plt.xlabel("Class")
 plt.ylabel("Count")
 plt.xticks(rotation=90)
@@ -793,31 +511,11 @@ print("class weights:")
 for k in sorted(class_weights.keys()):
     print(DISPLAY_CLASSES[k], "->", round(class_weights[k], 3))
 
-class RandomBrightnessContrast(tf.keras.layers.Layer):
-    def __init__(self, brightness=0.08, contrast=0.10):
-        super().__init__()
-        self.brightness = brightness
-        self.contrast = contrast
-
-    def call(self, x, training=None):
-        if not training:
-            return x
-
-        b = tf.random.uniform([], -self.brightness, self.brightness)
-        c = tf.random.uniform([], 1.0 - self.contrast, 1.0 + self.contrast)
-
-        x = x * c + b
-        x = tf.clip_by_value(x, 0.0, 1.0)
-        return x
-
-
 data_augmentation = tf.keras.Sequential([
     tf.keras.layers.RandomRotation(0.03),
     tf.keras.layers.RandomTranslation(0.05, 0.05),
     tf.keras.layers.RandomZoom(0.08),
-    RandomBrightnessContrast(0.08, 0.10),
 ], name="data_augmentation")
-
 
 model = tf.keras.Sequential([
     tf.keras.layers.Input(shape=(32, 32, 1)),
@@ -843,6 +541,7 @@ model = tf.keras.Sequential([
     tf.keras.layers.BatchNormalization(),
     tf.keras.layers.ReLU(),
 
+    # Better than Flatten for small datasets
     tf.keras.layers.GlobalAveragePooling2D(),
     tf.keras.layers.Dense(256, activation="relu"),
     tf.keras.layers.Dropout(0.35),
@@ -857,7 +556,7 @@ model.compile(
 
 model.summary()
 
-# 11
+# 17
 callbacks = [
     tf.keras.callbacks.EarlyStopping(
         monitor="val_accuracy",
@@ -899,12 +598,29 @@ plt.ylabel("accuracy")
 plt.legend()
 plt.show()
 
+pred_probs = model.predict(X_val[:16], verbose=0)
+pred_idx = np.argmax(pred_probs, axis=1)
+true_idx = np.argmax(Y_val[:16], axis=1)
+
+plt.figure(figsize=(12, 8))
+for i in range(16):
+    plt.subplot(4, 4, i + 1)
+    plt.imshow(X_val[i].squeeze(), cmap="gray")
+    plt.title(f"T:{DISPLAY_CLASSES[true_idx[i]]} P:{DISPLAY_CLASSES[pred_idx[i]]}")
+    plt.axis("off")
+plt.tight_layout()
+plt.show()
+
+val_loss, val_acc = model.evaluate(X_val, Y_val, verbose=0)
+print("Validation accuracy:", val_acc)
+
+# 20
 pred_probs = model.predict(X_val, verbose=0)
 pred_labels = np.argmax(pred_probs, axis=1)
 true_labels = np.argmax(Y_val, axis=1)
 
 accuracy = np.mean(pred_labels == true_labels)
-print("Validation accuracy:", accuracy)
+print("Manual accuracy:", accuracy)
 
 cm = confusion_matrix(true_labels, pred_labels)
 
@@ -915,18 +631,13 @@ plt.xticks(range(len(DISPLAY_CLASSES)), DISPLAY_CLASSES, rotation=90)
 plt.yticks(range(len(DISPLAY_CLASSES)), DISPLAY_CLASSES)
 plt.xlabel("Predicted")
 plt.ylabel("True")
-plt.title("Generated-data confusion matrix")
+plt.title("Confusion Matrix")
 plt.tight_layout()
 plt.show()
 
-plt.figure(figsize=(12, 8))
-for i in range(16):
-    plt.subplot(4, 4, i + 1)
-    plt.imshow(X_val[i].squeeze(), cmap="gray")
-    plt.title(f"T:{DISPLAY_CLASSES[true_labels[i]]} P:{DISPLAY_CLASSES[pred_labels[i]]}")
-    plt.axis("off")
-plt.tight_layout()
-plt.show()
+BASE_MODEL_KERAS_PATH = "/content/drive/MyDrive/sign_char_model.keras"
+BASE_MODEL_TFLITE_PATH = "/content/drive/MyDrive/sign_char_model.tflite"
+CLASSES_PATH = "/content/drive/MyDrive/sign_char_classes.json"
 
 model.save(BASE_MODEL_KERAS_PATH)
 print("saved keras model:", BASE_MODEL_KERAS_PATH)
@@ -937,13 +648,154 @@ tflite_model = converter.convert()
 with open(BASE_MODEL_TFLITE_PATH, "wb") as f:
     f.write(tflite_model)
 
-print("saved tflite model:", BASE_MODEL_TFLITE_PATH)
+print("Saved TFLite model to:", BASE_MODEL_TFLITE_PATH)
 
 with open(CLASSES_PATH, "w") as f:
     json.dump(CLASSES, f)
 
-print("saved class list:", CLASSES_PATH)
+print("Saved class list to:", CLASSES_PATH)
 
+interpreter = tf.lite.Interpreter(model_path=BASE_MODEL_TFLITE_PATH)
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print("Input details:", input_details)
+print("Output details:", output_details)
+
+x_test = X_val[0:1].astype(np.float32)
+
+interpreter.set_tensor(input_details[0]['index'], x_test)
+interpreter.invoke()
+output = interpreter.get_tensor(output_details[0]['index'])
+
+pred_idx = int(np.argmax(output))
+true_idx = int(np.argmax(Y_val[0]))
+
+print("True:", DISPLAY_CLASSES[true_idx])
+print("Pred:", DISPLAY_CLASSES[pred_idx])
+print("Confidence:", float(np.max(output)))
+
+real_files = sorted([
+    f for f in os.listdir(REAL_LINE_DIR)
+    if f.lower().endswith((".png", ".jpg", ".jpeg"))
+])
+
+print("num real line files:", len(real_files))
+print(real_files[:10])
+
+# 24
+def parse_line_filename(fname):
+    """
+    Real line-image filenames:
+    - ABC~12_001.png  -> "ABC 12"
+    - AB 12_001.png   -> "AB 12"
+    """
+    stem = os.path.splitext(fname)[0]
+    text = stem.split("_")[0]
+    return normalize_space_text(text)
+
+def segment_real_line_image(line_bgr, debug=False):
+    """
+    Segment visible characters only from a real line image.
+    Spaces are not segmented here; they are added later as synthetic blank crops.
+    """
+    hsv = cv2.cvtColor(line_bgr, cv2.COLOR_BGR2HSV)
+
+    lower_blue = np.array([90, 40, 40])
+    upper_blue = np.array([150, 255, 255])
+    mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+    mask = cv2.medianBlur(mask, 3)
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    H, W = mask.shape[:2]
+
+    col_sum = np.sum(mask > 0, axis=0).astype(float)
+    col_sum = col_sum / (np.max(col_sum) + 1e-6)
+
+    threshold = 0.05
+    splits = []
+    in_char = False
+    start = 0
+
+    for i, val in enumerate(col_sum):
+        if val > threshold and not in_char:
+            start = i
+            in_char = True
+        elif val <= threshold and in_char:
+            end = i
+            splits.append((start, end))
+            in_char = False
+
+    if in_char:
+        splits.append((start, W))
+
+    boxes = []
+    for (x0, x1) in splits:
+        width = x1 - x0
+
+        if width < 3:
+            continue
+        if width > 0.35 * W:
+            continue
+
+        col_region = mask[:, x0:x1]
+        rows = np.where(np.sum(col_region > 0, axis=1) > 0)[0]
+
+        if len(rows) == 0:
+            continue
+
+        y0 = rows[0]
+        y1 = rows[-1]
+
+        w = width
+        h = y1 - y0 + 1
+
+        if h < 0.35 * H:
+            continue
+
+        boxes.append((x0, y0, w, h))
+
+    if len(boxes) == 0:
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+
+            if w * h < 20:
+                continue
+            if h < 0.35 * H:
+                continue
+            if w > 0.35 * W:
+                continue
+
+            boxes.append((x, y, w, h))
+
+    boxes = sorted(boxes, key=lambda b: b[0])
+
+    crops = []
+    for x, y, w, h in boxes:
+        pad = max(2, int(0.12 * max(w, h)))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(W, x + w + pad)
+        y1 = min(H, y + h + pad)
+
+        crop = line_bgr[y0:y1, x0:x1]
+        processed = preprocess_training_crop(crop)
+        crops.append(processed)
+
+    if debug:
+        dbg = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        for x, y, w, h in boxes:
+            cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        return crops, mask, dbg, boxes
+
+    return crops, mask, None, boxes
+
+# 26
 sample_real = random.choice(real_files)
 sample_real_path = os.path.join(REAL_LINE_DIR, sample_real)
 sample_img = cv2.imread(sample_real_path)
@@ -955,7 +807,6 @@ print("sample file:", sample_real)
 print("expected text:", repr(sample_text))
 print("visible-only expected:", sample_text.replace(" ", ""))
 print("detected boxes:", len(real_boxes))
-print("space pattern inferred from boxes:", infer_spaces_from_boxes(real_boxes))
 
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 3, 1)
@@ -1009,10 +860,12 @@ for fname in real_files:
         continue
 
     for crop, ch in zip(crops, text_visible):
-        if ch in CLASS_TO_IDX:
-            X_real.append(crop)
-            y_real.append(CLASS_TO_IDX[ch])
+        if ch not in CLASS_TO_IDX:
+            continue
+        X_real.append(crop)
+        y_real.append(CLASS_TO_IDX[ch])
 
+    # Add explicit SPACE class samples
     for ch in text_full:
         if ch == " ":
             X_real.append(make_space_crop())
@@ -1028,14 +881,13 @@ print("good real line images:", good_real)
 print("bad real line images:", bad_real)
 print("X_real shape:", X_real.shape)
 print("y_real shape:", y_real.shape)
-print("some bad real examples:", bad_real_examples[:20])
+print("some bad real examples:", bad_real_examples[:10])
 
-# 16
-print("first 20 bad examples:")
-for ex in bad_real_examples[:20]:
+print("first 30 bad examples:")
+for ex in bad_real_examples[:30]:
     print(ex)
 
-failed = bad_real_examples[:12]
+failed = bad_real_examples[:20]
 
 for fname, reason in failed:
     path = os.path.join(REAL_LINE_DIR, fname)
@@ -1071,6 +923,9 @@ for fname, reason in failed:
 
     plt.show()
 
+"""Refine the model!"""
+
+# 30
 counts_real = np.bincount(y_real, minlength=len(CLASSES))
 
 print("total real char samples:", len(y_real))
@@ -1096,6 +951,7 @@ for i in range(16):
 plt.tight_layout()
 plt.show()
 
+# Build class weights for fine-tuning too
 real_class_weights_arr = compute_class_weight(
     class_weight="balanced",
     classes=np.unique(y_real),
@@ -1107,15 +963,17 @@ print("real fine-tune class weights:")
 for k in sorted(real_class_weights.keys()):
     print(DISPLAY_CLASSES[k], "->", round(real_class_weights[k], 3))
 
+#32 Fine tuning!
 Y_real = tf.keras.utils.to_categorical(y_real, len(CLASSES))
 
+# Fine-tune gently
 model.compile(
     optimizer=tf.keras.optimizers.Adam(5e-5),
     loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.03),
     metrics=["accuracy"]
 )
 
-callbacks_real = [
+callbacks = [
     tf.keras.callbacks.EarlyStopping(
         monitor="val_accuracy",
         patience=4,
@@ -1135,7 +993,7 @@ hist_real = model.fit(
     validation_split=0.15,
     epochs=15,
     batch_size=32,
-    callbacks=callbacks_real,
+    callbacks=callbacks,
     class_weight=real_class_weights,
     verbose=1
 )
@@ -1156,6 +1014,10 @@ plt.ylabel("accuracy")
 plt.legend()
 plt.show()
 
+FINETUNED_MODEL_KERAS_PATH = "/content/drive/MyDrive/sign_char_model_finetuned.keras"
+FINETUNED_MODEL_TFLITE_PATH = "/content/drive/MyDrive/sign_char_model_finetuned.tflite"
+CLASSES_PATH = "/content/drive/MyDrive/sign_char_classes.json"
+
 model.save(FINETUNED_MODEL_KERAS_PATH)
 print("saved keras model:", FINETUNED_MODEL_KERAS_PATH)
 
@@ -1165,28 +1027,24 @@ tflite_model = converter.convert()
 with open(FINETUNED_MODEL_TFLITE_PATH, "wb") as f:
     f.write(tflite_model)
 
-print("saved tflite model:", FINETUNED_MODEL_TFLITE_PATH)
+print("Saved TFLite model to:", FINETUNED_MODEL_TFLITE_PATH)
 
 with open(CLASSES_PATH, "w") as f:
     json.dump(CLASSES, f)
 
-print("saved class list:", CLASSES_PATH)
+print("Saved class list to:", CLASSES_PATH)
 
-# 20
 interpreter = tf.lite.Interpreter(model_path=FINETUNED_MODEL_TFLITE_PATH)
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-print("Input details:", input_details)
-print("Output details:", output_details)
-
 x_test = X_real[0:1].astype(np.float32)
 
-interpreter.set_tensor(input_details[0]["index"], x_test)
+interpreter.set_tensor(input_details[0]['index'], x_test)
 interpreter.invoke()
-output = interpreter.get_tensor(output_details[0]["index"])
+output = interpreter.get_tensor(output_details[0]['index'])
 
 pred_idx = int(np.argmax(output))
 true_idx = int(y_real[0])
